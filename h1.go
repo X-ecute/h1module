@@ -8,13 +8,15 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 )
 
 // H1Client represents the HackerOne API client
 type H1Client struct {
-	Username string
-	APIToken string
-	BaseURL  string
+	Username      string
+	APIToken      string
+	BaseURL       string
+	RateLimitDelay time.Duration
 }
 
 // Program represents a HackerOne program
@@ -78,9 +80,10 @@ type WeaknessesResponse struct {
 // NewH1Client creates a new HackerOne API client
 func NewH1Client(username, token string) *H1Client {
 	return &H1Client{
-		Username: username,
-		APIToken: token,
-		BaseURL:  "https://api.hackerone.com/v1/hackers",
+		Username:      username,
+		APIToken:      token,
+		BaseURL:       "https://api.hackerone.com/v1/hackers",
+		RateLimitDelay: 100 * time.Millisecond, // 600 requests per minute = ~100ms between requests
 	}
 }
 
@@ -113,6 +116,71 @@ func (c *H1Client) makeRequest(method, endpoint string) ([]byte, error) {
 	}
 
 	return body, nil
+}
+
+// GetAllProgramsPaginated gets all programs with pagination support
+func (c *H1Client) GetAllProgramsPaginated() ([]Program, error) {
+	var allPrograms []Program
+	nextURL := "/programs"
+	page := 1
+
+	for nextURL != "" {
+		fmt.Printf("Fetching page %d...\n", page)
+
+		body, err := c.makeRequest("GET", nextURL)
+		if err != nil {
+			return nil, fmt.Errorf("error fetching page %d: %v", page, err)
+		}
+
+		var response ProgramsResponse
+		err = json.Unmarshal(body, &response)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing page %d: %v", page, err)
+		}
+
+		allPrograms = append(allPrograms, response.Data...)
+		fmt.Printf("Page %d: fetched %d programs (total: %d)\n", page, len(response.Data), len(allPrograms))
+
+		// Check for next page
+		if nextLink, exists := response.Links["next"]; exists && nextLink != "" {
+			// Extract just the endpoint part from the full URL
+			nextURL = extractEndpoint(nextLink)
+			page++
+
+			// Respect rate limit
+			time.Sleep(c.RateLimitDelay)
+		} else {
+			nextURL = ""
+		}
+	}
+
+	return allPrograms, nil
+}
+
+// extractEndpoint extracts the API endpoint from a full URL
+func extractEndpoint(fullURL string) string {
+	// Remove the base URL part to get just the endpoint
+	baseURL := "https://api.hackerone.com/v1/hackers"
+	if strings.HasPrefix(fullURL, baseURL) {
+		return strings.TrimPrefix(fullURL, baseURL)
+	}
+	return fullURL
+}
+
+// SaveProgramsToFile saves programs to a JSON file
+func SaveProgramsToFile(programs []Program, filename string) error {
+	file, err := json.MarshalIndent(programs, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	err = ioutil.WriteFile(filename, file, 0644)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Successfully saved %d programs to %s\n", len(programs), filename)
+	return nil
 }
 
 // Mode 1: Get Structured Scopes for a program
@@ -149,7 +217,7 @@ func (c *H1Client) GetWeaknesses(programHandle string) (*WeaknessesResponse, err
 	return &response, nil
 }
 
-// Mode 3: Get All Programs
+// Mode 3: Get All Programs (single page - legacy)
 func (c *H1Client) GetAllPrograms() (*ProgramsResponse, error) {
 	body, err := c.makeRequest("GET", "/programs")
 	if err != nil {
@@ -215,11 +283,11 @@ func PrintWeaknesses(weaknesses *WeaknessesResponse, programHandle string) {
 }
 
 // PrintPrograms displays programs in a readable format
-func PrintPrograms(programs *ProgramsResponse) {
+func PrintPrograms(programs []Program) {
 	fmt.Printf("\n=== All Programs ===\n")
-	fmt.Printf("Found %d programs\n\n", len(programs.Data))
+	fmt.Printf("Found %d programs\n\n", len(programs))
 
-	for i, program := range programs.Data {
+	for i, program := range programs {
 		fmt.Printf("%d. %s (%s)\n", i+1, program.Attributes.Name, program.Attributes.Handle)
 		fmt.Printf("   State: %s\n", program.Attributes.State)
 		fmt.Printf("   Offers Bounties: %t\n", program.Attributes.OffersBounties)
@@ -256,10 +324,12 @@ func main() {
 
 	if len(os.Args) < 2 {
 		fmt.Println("Usage:")
-		fmt.Println("  h1module scopes <program_handle>    - Get structured scopes for a program")
-		fmt.Println("  h1module weaknesses <program_handle> - Get weaknesses for a program")
-		fmt.Println("  h1module programs                   - Get all programs")
-		fmt.Println("  h1module program <program_handle>   - Get specific program details")
+		fmt.Println("  h1module scopes <program_handle>        - Get structured scopes for a program")
+		fmt.Println("  h1module weaknesses <program_handle>    - Get weaknesses for a program")
+		fmt.Println("  h1module programs                       - Get all programs (single page)")
+		fmt.Println("  h1module programs-all                   - Get ALL programs with pagination")
+		fmt.Println("  h1module programs-all-save <filename>   - Get ALL programs and save to file")
+		fmt.Println("  h1module program <program_handle>       - Get specific program details")
 		return
 	}
 
@@ -295,7 +365,30 @@ func main() {
 		if err != nil {
 			log.Fatalf("Error getting programs: %v", err)
 		}
+		PrintPrograms(programs.Data)
+
+	case "programs-all":
+		programs, err := client.GetAllProgramsPaginated()
+		if err != nil {
+			log.Fatalf("Error getting all programs: %v", err)
+		}
 		PrintPrograms(programs)
+
+	case "programs-all-save":
+		if len(os.Args) < 3 {
+			log.Fatal("Please provide a filename")
+		}
+		filename := os.Args[2]
+
+		programs, err := client.GetAllProgramsPaginated()
+		if err != nil {
+			log.Fatalf("Error getting all programs: %v", err)
+		}
+
+		err = SaveProgramsToFile(programs, filename)
+		if err != nil {
+			log.Fatalf("Error saving to file: %v", err)
+		}
 
 	case "program":
 		if len(os.Args) < 3 {
@@ -310,6 +403,6 @@ func main() {
 		PrintProgram(program)
 
 	default:
-		log.Fatal("Invalid mode. Use: scopes, weaknesses, programs, or program")
+		log.Fatal("Invalid mode. Use: scopes, weaknesses, programs, programs-all, programs-all-save, or program")
 	}
 }
